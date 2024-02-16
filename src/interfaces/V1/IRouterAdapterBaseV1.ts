@@ -207,8 +207,8 @@ export type Market = {
  * @property priceStep The step for price.
  */
 export type GenericStaticMarketMetadata = {
-  maxLeverage?: FixedNumber
-  minLeverage?: FixedNumber
+  maxLeverage: FixedNumber
+  minLeverage: FixedNumber
   minInitialMargin: FixedNumber
   minPositionSize: FixedNumber
   minPositionSizeToken: FixedNumber
