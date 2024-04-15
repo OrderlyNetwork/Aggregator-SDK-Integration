@@ -8,6 +8,7 @@ import {
   AgentState,
   AmountInfo,
   ApiOpts,
+  AuthParams,
   AvailableToTradeParams,
   CancelOrder,
   ClaimInfo,
@@ -63,6 +64,7 @@ import {
   OrderlyLiquidationInfo,
   OrderlyPaginationMeta
 } from '../configs/orderly/types'
+import { tokens } from '../common/tokens'
 
 export default class OrderlyAdapter implements IAdapterV1 {
   protocolId: ProtocolId = 'ORDERLY'
@@ -115,6 +117,10 @@ export default class OrderlyAdapter implements IAdapterV1 {
   }
 
   async init(wallet: string | undefined, opts?: ApiOpts): Promise<void> {}
+
+  setCredentials(auth: AuthParams<this['protocolId']>): void {
+    throw new Error('Method not implemented.')
+  }
 
   async setup(): Promise<ActionParam[]> {
     return []
@@ -370,7 +376,8 @@ export default class OrderlyAdapter implements IAdapterV1 {
         maxLeverage: FixedNumber.fromString(String(1 / marketInfo.base_imr)),
         minLeverage: FixedNumber.fromString('1'),
         minInitialMargin: FixedNumber.fromString(String(marketInfo.base_imr)),
-        minPositionSize: FixedNumber.fromString(String(marketInfo.quote_min)), // TODO min position in base asset. `min_notional` is min position in quote asset
+        minPositionSize: FixedNumber.fromString(String(marketInfo.min_notional)),
+        minPositionSizeToken: FixedNumber.fromString(String(marketInfo.base_min)),
         maxPrecision: marketInfo.base_tick, // TODO check 0.001 -> 3 ? Used to display orderbook in USD
         amountStep: FixedNumber.fromString(String(marketInfo.base_tick)),
         priceStep: FixedNumber.fromString(String(marketInfo.quote_tick))
@@ -396,7 +403,11 @@ export default class OrderlyAdapter implements IAdapterV1 {
       sizeDeltaInToken: false,
       explicitFundingClaim: false,
       collateralDeltaInToken: false,
-      collateralUsesLimitPricing: false
+      collateralUsesLimitPricing: false,
+      depositData: {
+        '10': [tokens.USDC],
+        '42161': [tokens.USDC]
+      }
     }
   }
 
@@ -457,6 +468,7 @@ export default class OrderlyAdapter implements IAdapterV1 {
       const dynamicMetadata: DynamicMarketMetadata = {
         oiLong: FixedNumber.fromString(String(marketInfo.open_interest), 30),
         oiShort: FixedNumber.fromString(String(marketInfo.open_interest), 30),
+        isOiBifurcated: false,
         availableLiquidityLong: ZERO_FN, // TODO +-2% of orderbook
         availableLiquidityShort: ZERO_FN,
         longFundingRate: FixedNumber.fromString(String(marketInfo.last_funding_rate), 30),
@@ -855,7 +867,8 @@ export default class OrderlyAdapter implements IAdapterV1 {
           liqudationLeverage: ZERO_FN, // TODO based on maintenance margin
           timestamp: liquidation.timestamp,
           txHash: undefined,
-          collateral: ORDERLY_COLLATERAL_TOKEN
+          collateral: ORDERLY_COLLATERAL_TOKEN,
+          id: String(liquidation.liquidation_id)
         })
       })
     })
@@ -940,12 +953,14 @@ export default class OrderlyAdapter implements IAdapterV1 {
     return [
       {
         protocolId: 'ORDERLY',
-        accountEquity: FixedNumber.fromString(String(accountBalance + unsettledPnL)),
-        totalMarginUsed: ZERO_FN, // TODO position notional / account max leverage
-        maintainenceMargin: ZERO_FN, // TODO BTC/ETH 2.75%, alts 5%
-        withdrawable: FixedNumber.fromString(String(withdrawable)),
-        availableToTrade: FixedNumber.fromString(String(withdrawable)),
-        crossAccountLeverage: FixedNumber.fromString(String(accountInfo.max_leverage))
+        accountInfoData: {
+          accountEquity: FixedNumber.fromString(String(accountBalance + unsettledPnL)),
+          totalMarginUsed: ZERO_FN, // TODO position notional / account max leverage
+          maintainenceMargin: ZERO_FN, // TODO BTC/ETH 2.75%, alts 5%
+          withdrawable: FixedNumber.fromString(String(withdrawable)),
+          availableToTrade: FixedNumber.fromString(String(withdrawable)),
+          crossAccountLeverage: FixedNumber.fromString(String(accountInfo.max_leverage))
+        }
       }
     ]
   }
