@@ -65,6 +65,14 @@ import {
   OrderlyPaginationMeta
 } from '../configs/orderly/types'
 import { tokens } from '../common/tokens'
+import {
+  CACHE_MINUTE,
+  CACHE_SECOND,
+  CACHE_TIME_MULT,
+  ORDERLY_CACHE_PREFIX,
+  cacheFetch,
+  getStaleTime
+} from '../common/cache'
 
 export default class OrderlyAdapter implements IAdapterV1 {
   protocolId: ProtocolId = 'ORDERLY'
@@ -190,7 +198,7 @@ export default class OrderlyAdapter implements IAdapterV1 {
     for (const { amount, protocol, wallet } of params) {
       if (protocol !== 'ORDERLY') throw new Error('invalid protocol id')
 
-      const nonceRes = await this.signAndSendRequest('/v1/withdraw_nonce')
+      const nonceRes = await this.signAndSendRequest('/v1/withdraw_nonce', [], 0, { bypassCache: true })
       const nonceJson = await nonceRes.json()
       const withdrawNonce = nonceJson.data.withdraw_nonce as string
 
@@ -264,7 +272,7 @@ export default class OrderlyAdapter implements IAdapterV1 {
       throw new Error('Orderly key not initialized')
     }
 
-    const nonceRes = await this.signAndSendRequest('/v1/settle_nonce')
+    const nonceRes = await this.signAndSendRequest('/v1/settle_nonce', [], 0, { bypassCache: true })
     const nonceJson = await nonceRes.json()
     const settleNonce = nonceJson.data.settle_nonce as string
 
@@ -329,13 +337,22 @@ export default class OrderlyAdapter implements IAdapterV1 {
   }
 
   async supportedMarkets(chains: Chain[] | undefined, opts?: ApiOpts | undefined): Promise<MarketInfo[]> {
-    const res = await fetch(`${this.baseUrl}/v1/public/info`)
-    const marketInfos = (await res.json()).data.rows as API.Symbol[]
-    return marketInfos.map((marketInfo) => {
-      const [_, base, quote] = marketInfo.symbol.split('_') // symbols returned from API are always `PERP_<BASE>_<QUOTE>, so base token can be extrated like this
+    const sTimeFPU = getStaleTime(CACHE_MINUTE * 5, opts)
+    const symbolInfos = await cacheFetch({
+      key: [ORDERLY_CACHE_PREFIX, 'supportedMarkets'],
+      fn: async () => {
+        const res = await fetch(`${this.baseUrl}/v1/public/info`)
+        return (await res.json()).data.rows as API.Symbol[]
+      },
+      staleTime: sTimeFPU,
+      cacheTime: sTimeFPU * CACHE_TIME_MULT,
+      opts
+    })
+    return symbolInfos.map((symbolInfo) => {
+      const [_, base, quote] = symbolInfo.symbol.split('_') // symbols returned from API are always `PERP_<BASE>_<QUOTE>, so base token can be extrated like this
 
       const market: Market = {
-        marketId: encodeMarketId(orderly.id.toString(), 'ORDERLY', marketInfo.symbol),
+        marketId: encodeMarketId(orderly.id.toString(), 'ORDERLY', symbolInfo.symbol),
         chain: orderly,
         indexToken: ORDERLY_COLLATERAL_TOKEN,
         longCollateral: [ORDERLY_COLLATERAL_TOKEN],
@@ -373,14 +390,14 @@ export default class OrderlyAdapter implements IAdapterV1 {
 
       const staticMetadata: GenericStaticMarketMetadata = {
         // this is only for symbol. There's also max account leverage
-        maxLeverage: FixedNumber.fromString(String(1 / marketInfo.base_imr)),
+        maxLeverage: FixedNumber.fromString(String(1 / symbolInfo.base_imr)),
         minLeverage: FixedNumber.fromString('1'),
-        minInitialMargin: FixedNumber.fromString(String(marketInfo.base_imr)),
-        minPositionSize: FixedNumber.fromString(String(marketInfo.min_notional)),
-        minPositionSizeToken: FixedNumber.fromString(String(marketInfo.base_min)),
-        maxPrecision: marketInfo.base_tick, // TODO check 0.001 -> 3 ? Used to display orderbook in USD
-        amountStep: FixedNumber.fromString(String(marketInfo.base_tick)),
-        priceStep: FixedNumber.fromString(String(marketInfo.quote_tick))
+        minInitialMargin: FixedNumber.fromString(String(symbolInfo.base_imr)),
+        minPositionSize: FixedNumber.fromString(String(symbolInfo.min_notional)),
+        minPositionSizeToken: FixedNumber.fromString(String(symbolInfo.base_min)),
+        maxPrecision: symbolInfo.base_tick, // TODO check 0.001 -> 3 ? Used to display orderbook in USD
+        amountStep: FixedNumber.fromString(String(symbolInfo.base_tick)),
+        priceStep: FixedNumber.fromString(String(symbolInfo.quote_tick))
       }
 
       const protocol: Protocol = {
@@ -416,7 +433,12 @@ export default class OrderlyAdapter implements IAdapterV1 {
     params: AvailableToTradeParams<this['protocolId']>,
     opts?: ApiOpts | undefined
   ): Promise<AmountInfo> {
-    const res = await this.signAndSendRequest('/v1/positions')
+    const res = await this.signAndSendRequest(
+      '/v1/positions',
+      ['positions'],
+      getStaleTime(CACHE_SECOND * 15, opts),
+      opts
+    )
     const info = (await res.json()).data as API.PositionInfo
     return {
       amount: FixedNumber.fromString(String(info.free_collateral)),
@@ -427,8 +449,17 @@ export default class OrderlyAdapter implements IAdapterV1 {
   async getMarketPrices(marketIds: string[], opts?: ApiOpts | undefined): Promise<FixedNumber[]> {
     const prices: FixedNumber[] = []
 
-    const res = await fetch(`${this.baseUrl}/v1/public/futures`)
-    const marketInfos = (await res.json()).data.rows as API.MarketInfo[]
+    const sTimeFPU = getStaleTime(CACHE_MINUTE, opts)
+    const marketInfos = await cacheFetch({
+      key: [ORDERLY_CACHE_PREFIX, 'getMarketPrices'],
+      fn: async () => {
+        const res = await fetch(`${this.baseUrl}/v1/public/futures`)
+        return (await res.json()).data.rows as API.MarketInfo[]
+      },
+      staleTime: sTimeFPU,
+      cacheTime: sTimeFPU * CACHE_TIME_MULT,
+      opts
+    })
 
     marketIds.forEach((mId) => {
       const { protocolMarketId } = decodeMarketId(mId)
@@ -457,8 +488,17 @@ export default class OrderlyAdapter implements IAdapterV1 {
   async getDynamicMarketMetadata(marketIds: string[], opts?: ApiOpts | undefined): Promise<DynamicMarketMetadata[]> {
     const metadata: DynamicMarketMetadata[] = []
 
-    const res = await fetch(`${this.baseUrl}/v1/public/futures`)
-    const marketInfos = (await res.json()).data.rows as API.MarketInfo[]
+    const sTimeFPU = getStaleTime(CACHE_MINUTE, opts)
+    const marketInfos = await cacheFetch({
+      key: [ORDERLY_CACHE_PREFIX, 'getMarketPrices'],
+      fn: async () => {
+        const res = await fetch(`${this.baseUrl}/v1/public/futures`)
+        return (await res.json()).data.rows as API.MarketInfo[]
+      },
+      staleTime: sTimeFPU,
+      cacheTime: sTimeFPU * CACHE_TIME_MULT,
+      opts
+    })
 
     marketIds.forEach((mId) => {
       const { protocolMarketId } = decodeMarketId(mId)
@@ -632,7 +672,7 @@ export default class OrderlyAdapter implements IAdapterV1 {
     this.orderlyKey = base58.decode(privateKey.substring(8))
     const orderlyKey = `ed25519:${base58.encode(await getPublicKeyAsync(this.orderlyKey))}`
 
-    res = await this.signAndSendRequest('/v1/client/key_info')
+    res = await this.signAndSendRequest('/v1/client/key_info', ['keyInfo'], getStaleTime(CACHE_MINUTE, opts), opts)
     const response = await res.json()
 
     if (response.success) {
@@ -754,12 +794,16 @@ export default class OrderlyAdapter implements IAdapterV1 {
     pageOptions: PageOptions | undefined,
     opts?: ApiOpts | undefined
   ): Promise<PaginatedRes<PositionInfo>> {
-    let res = await this.signAndSendRequest('/v1/positions')
+    let res = await this.signAndSendRequest('/v1/positions', ['positions'], getStaleTime(CACHE_SECOND * 15, opts), opts)
     const info = (await res.json()).data as API.PositionInfo
     const positions = info.rows as API.Position[]
-    res = await this.signAndSendRequest('/v1/client/info')
+    res = await this.signAndSendRequest('/v1/client/info', ['clientInfo'], getStaleTime(CACHE_MINUTE, opts), opts)
     const accountInfo = (await res.json()).data as API.AccountInfo
-    res = await this.signAndSendRequest('/v1/funding_fee/history')
+    res = await this.signAndSendRequest(
+      '/v1/funding_fee/history',
+      ['fundingFeeHistory'],
+      getStaleTime(CACHE_MINUTE, opts)
+    )
     const fundingFees = (await res.json()).data.rows as FundingFeeHistory[]
 
     const accessibleMargin = await this.getAvailableToTrade(wallet, undefined as any)
@@ -842,7 +886,12 @@ export default class OrderlyAdapter implements IAdapterV1 {
     pageOptions: PageOptions | undefined,
     opts?: ApiOpts | undefined
   ): Promise<PaginatedRes<LiquidationInfo>> {
-    const res = await this.signAndSendRequest('/v1/liquidations')
+    const res = await this.signAndSendRequest(
+      '/v1/liquidations',
+      ['liquidations'],
+      getStaleTime(CACHE_SECOND * 15, opts),
+      opts
+    )
     const data = (await res.json()).data as any
     const meta = data.meta as OrderlyPaginationMeta
     const liquidations = data.rows as OrderlyLiquidationInfo[]
@@ -930,12 +979,12 @@ export default class OrderlyAdapter implements IAdapterV1 {
   }
 
   async getAccountInfo(wallet: string, opts?: ApiOpts | undefined): Promise<AccountInfo[]> {
-    let res = await this.signAndSendRequest('/v1/positions')
+    let res = await this.signAndSendRequest('/v1/positions', ['positions'], getStaleTime(CACHE_SECOND * 15, opts), opts)
     const info = (await res.json()).data as API.PositionInfo
     const positions = info.rows as API.Position[]
-    res = await this.signAndSendRequest('/v1/client/info')
+    res = await this.signAndSendRequest('/v1/client/info', ['clientInfo'], getStaleTime(CACHE_MINUTE, opts), opts)
     const accountInfo = (await res.json()).data as API.AccountInfo
-    res = await this.signAndSendRequest('/v1/client/holding')
+    res = await this.signAndSendRequest('/v1/client/holding', ['clientHolding'], getStaleTime(CACHE_MINUTE, opts), opts)
     const holdings = (await res.json()).data.holding as API.Holding[]
 
     const accountBalance = holdings.find((holding) => holding.token === 'USDC')?.holding ?? 0
@@ -984,7 +1033,12 @@ export default class OrderlyAdapter implements IAdapterV1 {
         }
       ]
     }
-    const res = await this.signAndSendRequest('/v1/client/key_info')
+    const res = await this.signAndSendRequest(
+      '/v1/client/key_info',
+      ['clientKeyInfo'],
+      getStaleTime(CACHE_MINUTE, opts),
+      opts
+    )
     // checking `success` is enough, because otherwise the API authentation would have failed already
     const success = (await res.json()).success
     return [
@@ -1004,7 +1058,12 @@ export default class OrderlyAdapter implements IAdapterV1 {
     const orderBooks: OrderBook[] = []
     for (const marketId of marketIds) {
       const { protocolMarketId } = decodeMarketId(marketId)
-      const res = await this.signAndSendRequest(`/v1/orderbook/${protocolMarketId}`)
+      const res = await this.signAndSendRequest(
+        `/v1/orderbook/${protocolMarketId}`,
+        ['orderbook', protocolMarketId],
+        getStaleTime(CACHE_SECOND * 5, opts),
+        opts
+      )
       const precisionOBData: Record<number, OBData> = {}
       const obData = (await res.json()).data as OrderbookData
       let totalSizeAsksToken = 0
@@ -1129,8 +1188,20 @@ export default class OrderlyAdapter implements IAdapterV1 {
     }
   }
 
-  public async signAndSendRequest(path: string, init?: RequestInit): Promise<Response> {
-    return fetch(`${this.baseUrl}${path}`, await this.getRequestInit(path, init))
+  public async signAndSendRequest(
+    path: string,
+    key: string[],
+    sTime: number,
+    opts?: ApiOpts | undefined,
+    init?: RequestInit
+  ): Promise<Response> {
+    return cacheFetch({
+      key: [ORDERLY_CACHE_PREFIX, ...key],
+      fn: async () => fetch(`${this.baseUrl}${path}`, await this.getRequestInit(path, init)),
+      staleTime: sTime,
+      cacheTime: sTime * CACHE_TIME_MULT,
+      opts
+    })
   }
 
   private async getRequestInit(path: string, init?: RequestInit): Promise<RequestInit> {
@@ -1236,7 +1307,12 @@ export default class OrderlyAdapter implements IAdapterV1 {
       query.append('size', String(pageOptions.limit))
     }
     const queryParams = query.toString()
-    const res = await this.signAndSendRequest(`/v1/orders${queryParams ? `?${queryParams}` : ''}`)
+    const res = await this.signAndSendRequest(
+      `/v1/orders${queryParams ? `?${queryParams}` : ''}`,
+      [`orders`, queryParams],
+      getStaleTime(CACHE_SECOND * 15, opts),
+      opts
+    )
     const data = (await res.json()).data as any
     const meta = data.meta as OrderlyPaginationMeta
     const orders = data.rows as API.Order[]
