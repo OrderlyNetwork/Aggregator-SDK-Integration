@@ -54,9 +54,10 @@ import { NativeUSDC__factory, Vault__factory } from '../../typechain/orderly'
 import { VaultTypes } from '../../typechain/orderly/Vault'
 import { BigNumber } from 'ethers'
 import { arbitrum, optimism } from 'viem/chains'
+import { order as orderHelper } from '@orderly.network/perp'
 import { API } from '@orderly.network/types'
 import { decodeMarketId, encodeMarketId } from '../common/markets'
-import { ORDERLY_COLLATERAL_TOKEN, orderly } from '../configs/orderly/config'
+import { ORDERLY_COLLATERAL_TOKEN, ORDERLY_TAKER_FEE_BPS, orderly } from '../configs/orderly/config'
 import { ZERO_FN } from '../common/constants'
 import {
   FundingFeeHistory,
@@ -73,6 +74,8 @@ import {
   cacheFetch,
   getStaleTime
 } from '../common/cache'
+import { toAmountInfoFN } from '../common/helper'
+import { traverseOrderlyBook } from '../configs/orderly/orderlyObTraversal'
 
 export default class OrderlyAdapter implements IAdapterV1 {
   protocolId: ProtocolId = 'ORDERLY'
@@ -337,17 +340,7 @@ export default class OrderlyAdapter implements IAdapterV1 {
   }
 
   async supportedMarkets(chains: Chain[] | undefined, opts?: ApiOpts | undefined): Promise<MarketInfo[]> {
-    const sTimeFPU = getStaleTime(CACHE_MINUTE * 5, opts)
-    const symbolInfos = await cacheFetch({
-      key: [ORDERLY_CACHE_PREFIX, 'supportedMarkets'],
-      fn: async () => {
-        const res = await fetch(`${this.baseUrl}/v1/public/info`)
-        return (await res.json()).data.rows as API.Symbol[]
-      },
-      staleTime: sTimeFPU,
-      cacheTime: sTimeFPU * CACHE_TIME_MULT,
-      opts
-    })
+    const symbolInfos = await this.getOrderlySymbolInfos(opts)
     return symbolInfos.map((symbolInfo) => {
       const [_, base, quote] = symbolInfo.symbol.split('_') // symbols returned from API are always `PERP_<BASE>_<QUOTE>, so base token can be extrated like this
 
@@ -433,13 +426,7 @@ export default class OrderlyAdapter implements IAdapterV1 {
     params: AvailableToTradeParams<this['protocolId']>,
     opts?: ApiOpts | undefined
   ): Promise<AmountInfo> {
-    const res = await this.signAndSendRequest(
-      '/v1/positions',
-      ['positions'],
-      getStaleTime(CACHE_SECOND * 15, opts),
-      opts
-    )
-    const info = (await res.json()).data as API.PositionInfo
+    const info = await this.getOrderlyPositionsInfo(opts)
     return {
       amount: FixedNumber.fromString(String(info.free_collateral)),
       isTokenAmount: false
@@ -450,16 +437,7 @@ export default class OrderlyAdapter implements IAdapterV1 {
     const prices: FixedNumber[] = []
 
     const sTimeFPU = getStaleTime(CACHE_MINUTE, opts)
-    const marketInfos = await cacheFetch({
-      key: [ORDERLY_CACHE_PREFIX, 'getMarketPrices'],
-      fn: async () => {
-        const res = await fetch(`${this.baseUrl}/v1/public/futures`)
-        return (await res.json()).data.rows as API.MarketInfo[]
-      },
-      staleTime: sTimeFPU,
-      cacheTime: sTimeFPU * CACHE_TIME_MULT,
-      opts
-    })
+    const marketInfos = await this.getOrderlyMarketInfos(opts)
 
     marketIds.forEach((mId) => {
       const { protocolMarketId } = decodeMarketId(mId)
@@ -794,12 +772,10 @@ export default class OrderlyAdapter implements IAdapterV1 {
     pageOptions: PageOptions | undefined,
     opts?: ApiOpts | undefined
   ): Promise<PaginatedRes<PositionInfo>> {
-    let res = await this.signAndSendRequest('/v1/positions', ['positions'], getStaleTime(CACHE_SECOND * 15, opts), opts)
-    const info = (await res.json()).data as API.PositionInfo
+    const info = await this.getOrderlyPositionsInfo(opts)
     const positions = info.rows as API.Position[]
-    res = await this.signAndSendRequest('/v1/client/info', ['clientInfo'], getStaleTime(CACHE_MINUTE, opts), opts)
-    const accountInfo = (await res.json()).data as API.AccountInfo
-    res = await this.signAndSendRequest(
+    const accountInfo = await this.getOrderlyAccountInfo(opts)
+    const res = await this.signAndSendRequest(
       '/v1/funding_fee/history',
       ['fundingFeeHistory'],
       getStaleTime(CACHE_MINUTE, opts)
@@ -937,24 +913,196 @@ export default class OrderlyAdapter implements IAdapterV1 {
     throw new Error('Method not implemented.')
   }
 
-  getOpenTradePreview(
+  async getOpenTradePreview(
     wallet: string,
     orderData: CreateOrder[],
     existingPos: (PositionInfo | undefined)[],
     opts?: ApiOpts | undefined
   ): Promise<OpenTradePreviewInfo[]> {
-    // TODO
-    throw new Error('Method not implemented.')
+    const positionInfo = await this.getOrderlyPositionsInfo(opts)
+    const positions = positionInfo.rows
+    const accountInfo = await this.getOrderlyAccountInfo(opts)
+
+    let i = 0
+    return Promise.all(
+      orderData.map(async (order) => {
+        const pos = existingPos[i]
+        const isMarket = order.type == 'MARKET'
+
+        const { protocolMarketId } = decodeMarketId(order.marketId)
+        const res = await this.signAndSendRequest(
+          `/v1/orderbook/${protocolMarketId}`,
+          ['orderbook', protocolMarketId],
+          getStaleTime(CACHE_SECOND * 5, opts),
+          opts
+        )
+        const obData = (await res.json()).data as OrderbookData
+
+        const triggerPrice = isMarket
+          ? order.direction === 'LONG'
+            ? obData.asks[0].price
+            : obData.bids[0].price
+          : order.triggerData!.triggerPrice!.toUnsafeFloat()
+        const newOrder = {
+          price: triggerPrice,
+          qty: order.sizeDelta.amount.toUnsafeFloat(),
+          symbol: protocolMarketId
+        }
+
+        const leverage = orderHelper.estLeverage({
+          totalCollateral: positionInfo.total_collateral_value,
+          positions,
+          newOrder
+        })!
+
+        const { avgExecPrice, remainingSize, priceImpact } = traverseOrderlyBook(
+          obData,
+          order.sizeDelta.amount.toUnsafeFloat(),
+          ORDERLY_TAKER_FEE_BPS,
+          order.direction === 'LONG'
+        )
+
+        const nextSize = pos
+          ? pos.direction === order.direction
+            ? pos.size.amount.addFN(order.sizeDelta.amount).abs()
+            : pos.size.amount.subFN(order.sizeDelta.amount).abs()
+          : order.sizeDelta.amount
+        const nextMargin = FixedNumber.fromString(String((nextSize.toUnsafeFloat() * triggerPrice) / leverage))
+
+        const symbolInfos = await this.getOrderlySymbolInfos(opts)
+        const symbol = symbolInfos.find((symbol) => symbol.symbol === protocolMarketId)!
+        const marketInfos = await this.getOrderlyMarketInfos(opts)
+        const market = marketInfos.find((market) => market.symbol === protocolMarketId)!
+
+        const orderFee = orderHelper.orderFee({
+          qty: order.sizeDelta.amount.toUnsafeFloat(),
+          price: triggerPrice,
+          futuresTakeFeeRate: accountInfo.futures_taker_fee_rate / 10_000
+        })
+
+        const estLiqPrice = orderHelper.estLiqPrice({
+          markPrice: market.mark_price,
+          baseIMR: symbol.base_imr,
+          baseMMR: symbol.base_mmr,
+          totalCollateral: positionInfo.total_collateral_value,
+          positions,
+          IMR_Factor: symbol.imr_factor,
+          orderFee,
+          newOrder
+        })
+
+        i++
+        return {
+          marketId: order.marketId,
+          collateral: order.collateral,
+          leverage: FixedNumber.fromValue(leverage),
+          size: toAmountInfoFN(nextSize, true),
+          margin: toAmountInfoFN(nextMargin, false),
+          avgEntryPrice: FixedNumber.fromValue(
+            positions.find((pos) => pos.symbol === protocolMarketId)!.average_open_price
+          ),
+          liqudationPrice: FixedNumber.fromValue(estLiqPrice),
+          fee: FixedNumber.fromValue(orderFee),
+          priceImpact,
+          isError: false,
+          errMsg: ''
+        } satisfies OpenTradePreviewInfo
+      })
+    )
   }
 
-  getCloseTradePreview(
+  async getCloseTradePreview(
     wallet: string,
-    positionInfo: PositionInfo[],
+    existingPos: PositionInfo[],
     closePositionData: ClosePositionData[],
     opts?: ApiOpts | undefined
   ): Promise<CloseTradePreviewInfo[]> {
-    // TODO
-    throw new Error('Method not implemented.')
+    const positionInfo = await this.getOrderlyPositionsInfo(opts)
+    const positions = positionInfo.rows
+    const accountInfo = await this.getOrderlyAccountInfo(opts)
+
+    let i = 0
+    return Promise.all(
+      closePositionData.map(async (closePosition) => {
+        const pos = existingPos[i]
+        const isMarket = closePosition.type == 'MARKET'
+
+        const { protocolMarketId } = decodeMarketId(pos.marketId)
+        const res = await this.signAndSendRequest(
+          `/v1/orderbook/${protocolMarketId}`,
+          ['orderbook', protocolMarketId],
+          getStaleTime(CACHE_SECOND * 5, opts),
+          opts
+        )
+        const obData = (await res.json()).data as OrderbookData
+
+        const triggerPrice = isMarket
+          ? pos.direction === 'LONG'
+            ? obData.bids[0].price
+            : obData.asks[0].price
+          : closePosition.triggerData!.triggerPrice!.toUnsafeFloat()
+        const newOrder = {
+          price: triggerPrice,
+          qty: closePosition.closeSize.amount.toUnsafeFloat(),
+          symbol: protocolMarketId
+        }
+
+        const leverage = orderHelper.estLeverage({
+          totalCollateral: positionInfo.total_collateral_value,
+          positions,
+          newOrder
+        })!
+
+        // const { avgExecPrice, remainingSize, priceImpact } = traverseOrderlyBook(
+        //   obData,
+        //   closePosition.closeSize.amount.toUnsafeFloat(),
+        //   ORDERLY_TAKER_FEE_BPS,
+        //   pos.direction === 'SHORT'
+        // )
+
+        const nextSize = pos.size.amount.subFN(closePosition.closeSize.amount).abs()
+        const nextMargin = FixedNumber.fromString(String((nextSize.toUnsafeFloat() * triggerPrice) / leverage))
+
+        const symbolInfos = await this.getOrderlySymbolInfos(opts)
+        const symbol = symbolInfos.find((symbol) => symbol.symbol === protocolMarketId)!
+        const marketInfos = await this.getOrderlyMarketInfos(opts)
+        const market = marketInfos.find((market) => market.symbol === protocolMarketId)!
+
+        const orderFee = orderHelper.orderFee({
+          qty: closePosition.closeSize.amount.toUnsafeFloat(),
+          price: triggerPrice,
+          futuresTakeFeeRate: accountInfo.futures_taker_fee_rate / 10_000
+        })
+
+        const estLiqPrice = orderHelper.estLiqPrice({
+          markPrice: market.mark_price,
+          baseIMR: symbol.base_imr,
+          baseMMR: symbol.base_mmr,
+          totalCollateral: positionInfo.total_collateral_value,
+          positions,
+          IMR_Factor: symbol.imr_factor,
+          orderFee,
+          newOrder
+        })
+
+        i++
+        return {
+          marketId: pos.marketId,
+          collateral: pos.collateral,
+          leverage: FixedNumber.fromValue(leverage),
+          size: toAmountInfoFN(nextSize, true),
+          margin: toAmountInfoFN(nextMargin, false),
+          avgEntryPrice: FixedNumber.fromValue(
+            positions.find((pos) => pos.symbol === protocolMarketId)!.average_open_price
+          ),
+          liqudationPrice: FixedNumber.fromValue(estLiqPrice),
+          fee: FixedNumber.fromValue(orderFee),
+          receiveMargin: toAmountInfoFN(ZERO_FN, true),
+          isError: false,
+          errMsg: ''
+        } satisfies CloseTradePreviewInfo
+      })
+    )
   }
 
   getUpdateMarginPreview(
@@ -979,12 +1127,15 @@ export default class OrderlyAdapter implements IAdapterV1 {
   }
 
   async getAccountInfo(wallet: string, opts?: ApiOpts | undefined): Promise<AccountInfo[]> {
-    let res = await this.signAndSendRequest('/v1/positions', ['positions'], getStaleTime(CACHE_SECOND * 15, opts), opts)
-    const info = (await res.json()).data as API.PositionInfo
-    const positions = info.rows as API.Position[]
-    res = await this.signAndSendRequest('/v1/client/info', ['clientInfo'], getStaleTime(CACHE_MINUTE, opts), opts)
-    const accountInfo = (await res.json()).data as API.AccountInfo
-    res = await this.signAndSendRequest('/v1/client/holding', ['clientHolding'], getStaleTime(CACHE_MINUTE, opts), opts)
+    const info = await this.getOrderlyPositionsInfo(opts)
+    const positions = info.rows
+    const accountInfo = await this.getOrderlyAccountInfo(opts)
+    const res = await this.signAndSendRequest(
+      '/v1/client/holding',
+      ['clientHolding'],
+      getStaleTime(CACHE_MINUTE, opts),
+      opts
+    )
     const holdings = (await res.json()).data.holding as API.Holding[]
 
     const accountBalance = holdings.find((holding) => holding.token === 'USDC')?.holding ?? 0
@@ -1317,5 +1468,50 @@ export default class OrderlyAdapter implements IAdapterV1 {
     const meta = data.meta as OrderlyPaginationMeta
     const orders = data.rows as API.Order[]
     return [meta, orders]
+  }
+
+  private async getOrderlySymbolInfos(opts?: ApiOpts) {
+    const sTimeFPU = getStaleTime(CACHE_MINUTE * 5, opts)
+    return cacheFetch({
+      key: [ORDERLY_CACHE_PREFIX, 'getOrderlySymbolInfos'],
+      fn: async () => {
+        const res = await fetch(`${this.baseUrl}/v1/public/info`)
+        return (await res.json()).data.rows as API.Symbol[]
+      },
+      staleTime: sTimeFPU,
+      cacheTime: sTimeFPU * CACHE_TIME_MULT,
+      opts
+    })
+  }
+
+  private async getOrderlyMarketInfos(opts?: ApiOpts) {
+    const sTimeFPU = getStaleTime(CACHE_MINUTE, opts)
+    return cacheFetch({
+      key: [ORDERLY_CACHE_PREFIX, 'getOrderlyMarketInfos'],
+      fn: async () => {
+        const res = await fetch(`${this.baseUrl}/v1/public/futures`)
+        return (await res.json()).data.rows as API.MarketInfo[]
+      },
+      staleTime: sTimeFPU,
+      cacheTime: sTimeFPU * CACHE_TIME_MULT,
+      opts
+    })
+  }
+
+  private async getOrderlyAccountInfo(opts?: ApiOpts) {
+    const res = await this.signAndSendRequest('/v1/client/info', ['clientInfo'], getStaleTime(CACHE_MINUTE, opts), opts)
+    const accountInfo = (await res.json()).data as API.AccountInfo
+    return accountInfo
+  }
+
+  private async getOrderlyPositionsInfo(opts?: ApiOpts) {
+    const res = await this.signAndSendRequest(
+      '/v1/positions',
+      ['positions'],
+      getStaleTime(CACHE_SECOND * 15, opts),
+      opts
+    )
+    const info = (await res.json()).data as API.PositionInfo
+    return info
   }
 }

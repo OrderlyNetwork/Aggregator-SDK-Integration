@@ -35,3 +35,6 @@ export const ORDERLY_COLLATERAL_TOKEN = {
     10: '0x7F5c764cBc14f9669B88837ca1490cCa17c31607'
   }
 } as Token
+
+// TODO configure your taker fee bps
+export const ORDERLY_TAKER_FEE_BPS = 6
